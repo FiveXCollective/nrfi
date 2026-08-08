@@ -64,13 +64,22 @@ EDGE_MIN = float(os.getenv("EDGE_MIN", "0.03"))      # +3pp edge vs book to call
 # [{"match": "Away Team @ Home Team", "nrfi": -115, "yrfi": -105}, ...]
 ODDS_FILE = os.getenv("ODDS_FILE", "")
 
-# Email (SMTP) — same pattern as the ATR scanner
+# Email delivery. Two transports, tried in this order:
+#   1. Resend HTTPS API (RESEND_API_KEY) — works on hosts that block SMTP
+#      egress (e.g. Railway blocks ports 25/465/587). Uses port 443.
+#   2. SMTP (SMTP_USER + SMTP_PASS) — fine locally or on hosts that allow it.
+# If neither is configured, the digest is printed to stdout.
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
+
+# SMTP (fallback) — same pattern as the ATR scanner
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASS = os.getenv("SMTP_PASS", "")
 EMAIL_TO = os.getenv("EMAIL_TO", "jxenakis@hotmail.com")
-EMAIL_FROM = os.getenv("EMAIL_FROM", SMTP_USER)
+# From address. For Resend this must be a verified-domain sender, or
+# "onboarding@resend.dev" (which can only deliver to your own account email).
+EMAIL_FROM = os.getenv("EMAIL_FROM") or SMTP_USER or "onboarding@resend.dev"
 
 
 # ----------------------------------------------------------------------------
@@ -372,21 +381,47 @@ def render_html(board, parlays):
 </div></body></html>"""
 
 
-def send_email(html):
-    if not SMTP_USER or not SMTP_PASS:
-        print("SMTP creds missing — printing digest to stdout instead.\n")
-        print(html[:2000])
-        return
+def _send_via_resend(subject, html):
+    """Send through the Resend HTTPS API (port 443). Raises on any error."""
+    r = requests.post(
+        "https://api.resend.com/emails",
+        headers={
+            "Authorization": f"Bearer {RESEND_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={"from": EMAIL_FROM, "to": [EMAIL_TO], "subject": subject, "html": html},
+        timeout=30,
+    )
+    if r.status_code >= 400:
+        raise RuntimeError(f"Resend API error {r.status_code}: {r.text}")
+    print(f"Sent digest to {EMAIL_TO} via Resend (id={r.json().get('id')})")
+
+
+def _send_via_smtp(subject, html):
+    """Send through SMTP. Note: many hosts (Railway) block SMTP egress."""
     msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"⚾ NRFI Edge Digest — {TODAY}"
+    msg["Subject"] = subject
     msg["From"] = EMAIL_FROM
     msg["To"] = EMAIL_TO
     msg.attach(MIMEText(html, "html"))
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as s:
         s.starttls()
         s.login(SMTP_USER, SMTP_PASS)
         s.sendmail(EMAIL_FROM, [EMAIL_TO], msg.as_string())
-    print(f"Sent digest to {EMAIL_TO}")
+    print(f"Sent digest to {EMAIL_TO} via SMTP")
+
+
+def send_email(html):
+    subject = f"⚾ NRFI Edge Digest — {TODAY}"
+    if RESEND_API_KEY:
+        _send_via_resend(subject, html)
+        return
+    if SMTP_USER and SMTP_PASS:
+        _send_via_smtp(subject, html)
+        return
+    print("No email transport configured (set RESEND_API_KEY or SMTP creds) —"
+          " printing digest to stdout instead.\n")
+    print(html[:2000])
 
 
 def main():

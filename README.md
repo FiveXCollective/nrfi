@@ -24,7 +24,12 @@ First run pulls Statcast for ~30 starters (~1-2 min); pybaseball caches after.
 1. Push this folder to a GitHub repo.
 2. Railway → New Project → Deploy from GitHub → pick the repo.
    Nixpacks auto-detects Python and installs `requirements.txt`.
-3. Service → **Variables** → add everything from `.env.example` (SMTP_* etc.).
+3. Service → **Variables** → add everything from `.env.example`.
+   **Important:** Railway blocks outbound SMTP (ports 25/465/587), so Gmail/SMTP
+   sending fails there. Use **Resend** instead — set `RESEND_API_KEY` (sends over
+   HTTPS/443). The script auto-prefers Resend when that key is present and only
+   falls back to SMTP otherwise. Set `EMAIL_FROM` to a Resend verified-domain
+   sender, or `onboarding@resend.dev` (which only delivers to your account email).
 4. Service → **Settings → Cron Schedule** → enter a 5-field crontab in **UTC**.
    - `0 15 * * *` = **11:00 AM ET (EDT)** — lineups are firming up by then, which
      the top-of-order adjustment relies on. This is the recommended slot.

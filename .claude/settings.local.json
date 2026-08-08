@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -m venv venv)",
+      "Bash(./venv/bin/python -m pip install --quiet --upgrade pip)",
+      "Bash(./venv/bin/pip install *)",
+      "Bash(env -u SMTP_USER -u SMTP_PASS SCAN_DATE=2026-08-08 ./venv/bin/python nrfi_scanner.py)"
+    ]
+  }
+}
