@@ -1,0 +1,19 @@
+# Secrets
+.env
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# pybaseball cache
+.pybaseball/
+
+# Odds file (optional, may contain private lines)
+lines.json
+
+# macOS
+.DS_Store
