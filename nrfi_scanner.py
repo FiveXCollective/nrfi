@@ -60,6 +60,11 @@ MIN_STARTS_CONF = int(os.getenv("MIN_STARTS_CONF", "5"))  # both starters need t
 MODEL_MIN_PROB = float(os.getenv("MODEL_MIN_PROB", "0.55"))  # threshold to call it a "lean"
 EDGE_MIN = float(os.getenv("EDGE_MIN", "0.03"))      # +3pp edge vs book to call it a play
 
+# v2.1: only let games with a POSTED lineup (both sides, 9 batters) into parlays.
+# Lineups firm up a few hours pre-game; set this to "1" for a late-morning/pre-game
+# re-run so you don't stack legs on a stale slate (probables can scratch).
+REQUIRE_CONFIRMED_LINEUPS = os.getenv("REQUIRE_CONFIRMED_LINEUPS", "0") == "1"
+
 # Optional: JSON file of book lines to compute edge. Format:
 # [{"match": "Away Team @ Home Team", "nrfi": -115, "yrfi": -105}, ...]
 ODDS_FILE = os.getenv("ODDS_FILE", "")
@@ -88,7 +93,7 @@ EMAIL_FROM = os.getenv("EMAIL_FROM") or SMTP_USER or "onboarding@resend.dev"
 def fetch_slate(date_str):
     r = requests.get(
         f"{MLB_API}/schedule",
-        params={"sportId": 1, "date": date_str, "hydrate": "probablePitcher,team"},
+        params={"sportId": 1, "date": date_str, "hydrate": "probablePitcher,lineups,team"},
         timeout=30,
     )
     r.raise_for_status()
@@ -98,6 +103,10 @@ def fetch_slate(date_str):
             home, away = g["teams"]["home"], g["teams"]["away"]
             hp = home.get("probablePitcher") or {}
             ap = away.get("probablePitcher") or {}
+            # Posted batting orders (empty until the lineup card drops, ~hrs pre-game).
+            lu = g.get("lineups") or {}
+            home_lineup = [(p.get("id"), p.get("fullName")) for p in (lu.get("homePlayers") or [])]
+            away_lineup = [(p.get("id"), p.get("fullName")) for p in (lu.get("awayPlayers") or [])]
             games.append({
                 "game_pk": g["gamePk"],
                 "start": g.get("gameDate"),
@@ -109,6 +118,8 @@ def fetch_slate(date_str):
                 "home_pid": hp.get("id"),
                 "away_pitcher": ap.get("fullName"),
                 "away_pid": ap.get("id"),
+                "home_lineup": home_lineup,
+                "away_lineup": away_lineup,
             })
     return games
 
@@ -258,11 +269,24 @@ def build_board(games, odds):
         min_starts = min(h["starts"], a["starts"])
         conf = "HIGH" if min_starts >= MIN_STARTS_CONF else ("MED" if min_starts >= 2 else "LOW")
 
+        # Lineups: both batting orders posted (9 each) => confirmed. The home
+        # starter faces the AWAY top-of-order (top 1st); away starter faces the
+        # HOME top-of-order (bottom 1st). Shown for transparency; the offense
+        # input stays team-level here (player-level is the next upgrade).
+        home_conf = len(g["away_lineup"]) >= 9  # home starter's opponents posted
+        away_conf = len(g["home_lineup"]) >= 9  # away starter's opponents posted
+        lineups_confirmed = home_conf and away_conf
+        home_opp_top3 = ", ".join(n for _, n in g["away_lineup"][:3]) if home_conf else ""
+        away_opp_top3 = ", ".join(n for _, n in g["home_lineup"][:3]) if away_conf else ""
+
         row = {
             "match": f'{g["away_team"]} @ {g["home_team"]}',
             "home_p": g["home_pitcher"], "away_p": g["away_pitcher"],
             "home_line": f'{h["clean"]}/{h["starts"]} clean · opp off {1-away_off:.0%} score',
             "away_line": f'{a["clean"]}/{a["starts"]} clean · opp off {1-home_off:.0%} score',
+            "home_opp_top3": home_opp_top3,
+            "away_opp_top3": away_opp_top3,
+            "lineups": lineups_confirmed,
             "p_nrfi": p_nrfi,
             "fair": fair_american(p_nrfi),
             "conf": conf,
@@ -284,11 +308,13 @@ def build_board(games, odds):
 
 def suggest_parlays(board):
     """Legs: leaning NRFI, with at least MED confidence. If a book line is
-    present, require +EV. Otherwise rank by model prob."""
+    present, require +EV. Otherwise rank by model prob. When
+    REQUIRE_CONFIRMED_LINEUPS is set, only games with posted lineups qualify."""
     legs = [
         r for r in board
         if r["p_nrfi"] >= MODEL_MIN_PROB and r["conf"] != "LOW"
         and (r["edge"] is None or r["edge"] >= EDGE_MIN)
+        and (r["lineups"] or not REQUIRE_CONFIRMED_LINEUPS)
     ]
     out = {}
     for n in (2, 3, 4):
@@ -312,19 +338,30 @@ def render_html(board, parlays):
         col = "#2ecc71" if r["edge"] >= EDGE_MIN else ("#e74c3c" if r["edge"] < 0 else "#f1c40f")
         return f'<span style="color:{col};font-weight:600">{r["edge"]*100:+.1f}pp</span>'
 
+    def lineups_cell(r):
+        if r["lineups"]:
+            return '<span style="color:#2ecc71;font-weight:600">✓ Set</span>'
+        return '<span style="color:#7a8699">Pending</span>'
+
+    def starter_block(name, line, opp_top3):
+        extra = (f'<br><span style="color:#5c6b7d;font-size:11px">vs {opp_top3}</span>'
+                 if opp_top3 else "")
+        return f'{name} <span style="color:#5c6b7d">({line})</span>{extra}'
+
     rows = ""
     for r in board:
         rows += f"""
         <tr>
           <td style="padding:10px 8px;border-bottom:1px solid #1f2733">{r['match']}</td>
           <td style="padding:10px 8px;border-bottom:1px solid #1f2733;font-size:12px;color:#9fb0c3">
-            {r['away_p']} <span style="color:#5c6b7d">({r['away_line']})</span><br>
-            {r['home_p']} <span style="color:#5c6b7d">({r['home_line']})</span>
+            {starter_block(r['away_p'], r['away_line'], r['away_opp_top3'])}<br>
+            {starter_block(r['home_p'], r['home_line'], r['home_opp_top3'])}
           </td>
           <td align="center" style="padding:10px 8px;border-bottom:1px solid #1f2733;font-weight:700">{pct(r['p_nrfi'])}</td>
           <td align="center" style="padding:10px 8px;border-bottom:1px solid #1f2733">{r['fair']:+d}</td>
           <td align="center" style="padding:10px 8px;border-bottom:1px solid #1f2733">{r['book'] if r['book'] is not None else '—'}</td>
           <td align="center" style="padding:10px 8px;border-bottom:1px solid #1f2733">{edge_cell(r)}</td>
+          <td align="center" style="padding:10px 8px;border-bottom:1px solid #1f2733;font-size:11px">{lineups_cell(r)}</td>
           <td align="center" style="padding:10px 8px;border-bottom:1px solid #1f2733;font-size:11px;color:#9fb0c3">{r['conf']}</td>
         </tr>"""
 
@@ -343,6 +380,13 @@ def render_html(board, parlays):
     if not parlay_html:
         parlay_html = '<div style="color:#7a8699">No legs cleared the threshold today.</div>'
 
+    n_confirmed = sum(1 for r in board if r["lineups"])
+    parlay_gate_note = (
+        "Parlays limited to games with lineups posted (REQUIRE_CONFIRMED_LINEUPS=1)."
+        if REQUIRE_CONFIRMED_LINEUPS else
+        "Confirm lineups before firing — set REQUIRE_CONFIRMED_LINEUPS=1 on a late run to auto-exclude pending games."
+    )
+
     has_odds = any(r["book"] is not None for r in board)
     odds_note = "" if has_odds else (
         '<div style="background:#2a1f12;border:1px solid #5c4326;border-radius:8px;'
@@ -355,27 +399,29 @@ def render_html(board, parlays):
 <!doctype html><html><body style="margin:0;background:#0b0f14;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif">
 <div style="max-width:720px;margin:0 auto;padding:24px 16px;color:#e6edf3">
   <div style="font-size:22px;font-weight:800;letter-spacing:.3px">⚾ NRFI Edge Digest</div>
-  <div style="color:#7a8699;font-size:13px;margin:2px 0 18px">{TODAY} · {len(board)} games modeled</div>
+  <div style="color:#7a8699;font-size:13px;margin:2px 0 18px">{TODAY} · {len(board)} games modeled · {n_confirmed}/{len(board)} lineups set</div>
   {odds_note}
   <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;font-size:13px">
     <thead><tr style="color:#7a8699;text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.5px">
       <th style="padding:6px 8px">Game</th><th style="padding:6px 8px">Starters (1st-inn history)</th>
       <th style="padding:6px 8px" align="center">Model NRFI</th><th style="padding:6px 8px" align="center">Fair</th>
       <th style="padding:6px 8px" align="center">Book</th><th style="padding:6px 8px" align="center">Edge</th>
+      <th style="padding:6px 8px" align="center">Lineups</th>
       <th style="padding:6px 8px" align="center">Conf</th>
     </tr></thead><tbody>{rows}</tbody>
   </table>
 
   <div style="font-size:16px;font-weight:800;margin:26px 0 4px">Suggested Parlays</div>
   <div style="color:#7a8699;font-size:12px;margin-bottom:6px">
-    Only +EV if each leg beats its book price — the vig compounds per leg. Confirm lineups before firing.</div>
+    Only +EV if each leg beats its book price — the vig compounds per leg. {parlay_gate_note}</div>
   {parlay_html}
 
   <div style="color:#5c6b7d;font-size:11px;margin-top:24px;line-height:1.5">
     Model: each 1st-inning half = starter's scoreless rate (Statcast, season-to-date, shrunk to a
     {LEAGUE_HALF_SCORELESS:.0%} prior) blended via log5 with the opposing offense's 1st-inning scoring
     rate. P(NRFI) = top-half scoreless × bottom-half scoreless.
-    v2 TODO: park, weather, umpire, confirmed lineups, half-correlation.
+    "Lineups ✓ Set" = both batting orders posted; "vs" lists the opposing top-of-order each starter faces.
+    v2 TODO: park, weather, umpire, player-level top-of-order, half-correlation.
     Not financial advice — bet within your means.
   </div>
 </div></body></html>"""
@@ -436,7 +482,9 @@ def main():
         return
     odds = load_odds()
     board = build_board(games, odds)
-    print(f"  {len(board)} games modeled")
+    n_confirmed = sum(1 for r in board if r["lineups"])
+    print(f"  {len(board)} games modeled · {n_confirmed} with lineups posted"
+          + (" · parlays require confirmed lineups" if REQUIRE_CONFIRMED_LINEUPS else ""))
     parlays = suggest_parlays(board)
     html = render_html(board, parlays)
     send_email(html)

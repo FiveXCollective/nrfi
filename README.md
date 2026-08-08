@@ -57,10 +57,19 @@ of the 1st, the away starter faces the **home** bats in the bottom.
 `P(NRFI) = P(top scoreless) × P(bottom scoreless)`. The digest shows each
 opponent's "opp off X% score" so you can see the adjustment working.
 
+### Confirmed lineups (v2.1)
+The digest shows a **Lineups** status per game — "✓ Set" once both batting orders
+are posted (they firm up a few hours pre-game), else "Pending" — and lists the
+opposing top-of-order (`vs …`) each starter faces. Set `REQUIRE_CONFIRMED_LINEUPS=1`
+on a late-morning/pre-game re-run to keep pending-lineup games out of the suggested
+parlays, so you don't stack legs on a stale slate (probables can scratch).
+
 ### v2 upgrades (in priority order)
 1. ~~Opposing top-of-order quality~~ ✅ done (team-level; player-level is a further refinement).
-2. Park factor + weather (wind/temp).
-3. Confirmed lineups (re-run late morning; probables can scratch).
-4. Home-plate umpire zone.
-5. Half-inning correlation instead of strict independence.
-6. Then clone the whole skeleton for K-props and SB markets.
+2. ~~Confirmed lineups~~ ✅ done (status + parlay gating; see above).
+3. Live NRFI odds feed → auto de-vigged edge + EV (biggest betting win).
+4. Park factor + weather (wind/temp).
+5. Player-level top-of-order (actual 1–3 hitters vs the starter's hand).
+6. Home-plate umpire zone.
+7. Half-inning correlation instead of strict independence.
+8. Then clone the whole skeleton for K-props and SB markets.
