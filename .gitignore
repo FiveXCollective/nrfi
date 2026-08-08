@@ -15,5 +15,8 @@ __pycache__/
 # Odds file (optional, may contain private lines)
 lines.json
 
+# Claude Code local settings (machine-specific)
+.claude/settings.local.json
+
 # macOS
 .DS_Store
