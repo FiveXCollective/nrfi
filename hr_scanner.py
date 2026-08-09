@@ -22,6 +22,7 @@ handedness, and the backtest are layered on next.
 
 import os
 import sys
+import math
 import datetime as dt
 
 import requests
@@ -36,6 +37,14 @@ SEASON = int(os.getenv("SEASON", TODAY[:4]))
 BAT_PRIOR_PA = float(os.getenv("BAT_PRIOR_PA", "170"))   # HR/PA stabilizes ~170 PA
 PIT_PRIOR_BF = float(os.getenv("PIT_PRIOR_BF", "200"))   # HR/BF stabilizes slowly
 P_PA_CAP = float(os.getenv("P_PA_CAP", "0.15"))          # sanity clamp on per-PA HR prob
+
+# Platt recalibration of the raw model probability, fitted by backtest_hr.py over
+# ~18.8k batter-games (May-Aug 2026). The raw model is well-calibrated in the bulk
+# but overconfident on longshots; this pulls the extremes back to reality.
+#   p_cal = sigmoid(RECAL_A + RECAL_B * logit(p_raw))
+# Refit periodically (re-run backtest_hr.py, paste the new a/b, or override via env).
+RECAL_A = float(os.getenv("RECAL_A", "-0.559"))
+RECAL_B = float(os.getenv("RECAL_B", "0.742"))
 
 # Expected plate appearances by batting-order slot (index 0 = leadoff).
 PA_BY_SLOT = [4.65, 4.55, 4.45, 4.35, 4.25, 4.13, 4.02, 3.92, 3.80]
@@ -97,11 +106,18 @@ def pitcher_rate(pits, pid, league):
 
 
 def p_hr_game(bat_r, pit_r, league, park, slot):
-    """P(>=1 HR) for one batter vs one starter in one park, given lineup slot."""
+    """Raw P(>=1 HR) for one batter vs one starter in one park, given lineup slot."""
     p_pa = bat_r * pit_r / league * park
     p_pa = max(0.0005, min(P_PA_CAP, p_pa))
     pa = PA_BY_SLOT[slot] if 0 <= slot < len(PA_BY_SLOT) else 4.0
     return 1 - (1 - p_pa) ** pa, p_pa
+
+
+def recalibrate(p):
+    """Apply the fitted Platt correction to a raw model probability."""
+    p = min(max(p, 1e-6), 1 - 1e-6)
+    z = RECAL_A + RECAL_B * math.log(p / (1 - p))
+    return 1 / (1 + math.exp(-z))
 
 
 def build_board():
@@ -123,11 +139,12 @@ def build_board():
             pit_r = pitcher_rate(pits, opp_pid, league)
             for slot, (bid, bname) in enumerate(lineup):
                 bat_r = batter_rate(bats, bid, league)
-                p_hr, p_pa = p_hr_game(bat_r, pit_r, league, park, slot)
+                p_raw, p_pa = p_hr_game(bat_r, pit_r, league, park, slot)
+                p_hr = recalibrate(p_raw)
                 board.append({
                     "batter": bname, "team": g[f"{side}_team"],
                     "opp_p": opp_name, "park": park, "slot": slot + 1,
-                    "p_hr": p_hr, "fair": n.fair_american(p_hr),
+                    "p_hr": p_hr, "p_raw": p_raw, "fair": n.fair_american(p_hr),
                     "bat_hr_pa": bat_r, "pit_hr_pa": pit_r,
                     "match": f'{g["away_team"]} @ {g["home_team"]}',
                 })
@@ -142,10 +159,11 @@ def main():
         print("No posted lineups yet — HR scanner runs best mid-afternoon.")
         return
     print(f"  {len(board)} batters in posted lineups\n")
-    print(f"{'Batter':22} {'Team':22} {'Slot':>4} {'Park':>5} {'vs SP':20} {'P(HR)':>6} {'Fair':>6}")
+    print(f"{'Batter':22} {'Team':22} {'Slot':>4} {'Park':>5} {'vs SP':20} {'raw':>5} {'P(HR)':>6} {'Fair':>6}")
     for r in board[:25]:
         print(f"{r['batter'][:22]:22} {r['team'][:22]:22} {r['slot']:>4} "
-              f"{r['park']:>5.2f} {r['opp_p'][:20]:20} {r['p_hr']*100:5.1f}% {r['fair']:>+6d}")
+              f"{r['park']:>5.2f} {r['opp_p'][:20]:20} {r['p_raw']*100:4.1f}% "
+              f"{r['p_hr']*100:5.1f}% {r['fair']:>+6d}")
 
 
 if __name__ == "__main__":
