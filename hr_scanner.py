@@ -23,7 +23,10 @@ handedness, and the backtest are layered on next.
 import os
 import sys
 import math
+import statistics
+import unicodedata
 import datetime as dt
+from collections import defaultdict
 
 import requests
 
@@ -37,6 +40,14 @@ SEASON = int(os.getenv("SEASON", TODAY[:4]))
 BAT_PRIOR_PA = float(os.getenv("BAT_PRIOR_PA", "170"))   # HR/PA stabilizes ~170 PA
 PIT_PRIOR_BF = float(os.getenv("PIT_PRIOR_BF", "200"))   # HR/BF stabilizes slowly
 P_PA_CAP = float(os.getenv("P_PA_CAP", "0.15"))          # sanity clamp on per-PA HR prob
+
+# Anytime-HR odds via The Odds API (market key batter_home_runs, Over 0.5).
+ODDS_API = "https://api.the-odds-api.com/v4"
+ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
+ODDS_REGIONS = os.getenv("ODDS_REGIONS", "us")
+# A value play must appear at >= this many books (consensus guard). A lone soft
+# book — common early in the day — produces fake longshot "edges", so gate them out.
+MIN_BOOKS_VALUE = int(os.getenv("MIN_BOOKS_VALUE", "2"))
 
 # Platt recalibration of the raw model probability, fitted by backtest_hr.py over
 # ~18.8k batter-games (May-Aug 2026). The raw model is well-calibrated in the bulk
@@ -120,10 +131,72 @@ def recalibrate(p):
     return 1 / (1 + math.exp(-z))
 
 
+def _norm(s):
+    """Accent- and punctuation-insensitive name key (García Jr. -> garciajr)."""
+    s = unicodedata.normalize("NFKD", s or "")
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return "".join(c.lower() for c in s if c.isalnum())
+
+
+def load_hr_odds(games):
+    """(match, norm_name) -> {price, book, fair, n_books} for anytime HR (Over 0.5).
+    price/book = best US payout; fair = median per-book de-vig where the Under side
+    exists (anytime HR is often one-sided, in which case fair is None)."""
+    ev = requests.get(f"{ODDS_API}/sports/baseball_mlb/events",
+                      params={"apiKey": ODDS_API_KEY}, timeout=30)
+    ev.raise_for_status()
+    by_pair = {}
+    for e in ev.json():
+        by_pair.setdefault((n._norm_team(e.get("away_team")),
+                            n._norm_team(e.get("home_team"))), []).append(e)
+
+    out, calls = {}, 0
+    for g in games:
+        cands = by_pair.get((n._norm_team(g["away_team"]), n._norm_team(g["home_team"])))
+        if not cands:
+            continue
+        eid = cands[0]["id"]
+        r = requests.get(
+            f"{ODDS_API}/sports/baseball_mlb/events/{eid}/odds",
+            params={"apiKey": ODDS_API_KEY, "regions": ODDS_REGIONS,
+                    "markets": "batter_home_runs", "oddsFormat": "american"},
+            timeout=30)
+        calls += 1
+        if r.status_code != 200:
+            continue
+        match = f'{g["away_team"]} @ {g["home_team"]}'
+        players = defaultdict(lambda: {"over": [], "under": {}})
+        for bm in r.json().get("bookmakers", []):
+            for mk in bm.get("markets", []):
+                if mk.get("key") != "batter_home_runs":
+                    continue
+                for oc in mk.get("outcomes", []):
+                    if abs(float(oc.get("point", 0)) - 0.5) > 1e-9:
+                        continue  # only the 0.5 line is "anytime HR"
+                    nm = _norm(oc.get("description"))
+                    if oc.get("name") == "Over":
+                        players[nm]["over"].append((bm.get("key"), oc.get("price")))
+                    elif oc.get("name") == "Under":
+                        players[nm]["under"][bm.get("key")] = oc.get("price")
+        for nm, d in players.items():
+            if not d["over"]:
+                continue
+            best_book, best_price = max(d["over"], key=lambda x: n.american_to_decimal(x[1]))
+            fairs = [n.devig_two_way(pr, d["under"][bk]) for bk, pr in d["over"] if bk in d["under"]]
+            out[(match, nm)] = {
+                "price": best_price, "book": best_book,
+                "fair": statistics.median(fairs) if fairs else None,
+                "n_books": len(d["over"]),
+            }
+    print(f"  odds: {calls} event calls (~{calls + 1} credits), {len(out)} player prices")
+    return out
+
+
 def build_board():
     games = n.fetch_slate(TODAY)
     bats, pits, league = load_rate_tables()
     print(f"  league HR/PA = {league:.4f}  ({len(bats)} batters, {len(pits)} pitchers)")
+    odds = load_hr_odds(games) if ODDS_API_KEY else {}
 
     board = []
     for g in games:
@@ -137,17 +210,27 @@ def build_board():
             if len(lineup) < 9 or not opp_pid:
                 continue  # need posted lineup + known opposing starter
             pit_r = pitcher_rate(pits, opp_pid, league)
+            match = f'{g["away_team"]} @ {g["home_team"]}'
             for slot, (bid, bname) in enumerate(lineup):
                 bat_r = batter_rate(bats, bid, league)
                 p_raw, p_pa = p_hr_game(bat_r, pit_r, league, park, slot)
                 p_hr = recalibrate(p_raw)
-                board.append({
+                row = {
                     "batter": bname, "team": g[f"{side}_team"],
                     "opp_p": opp_name, "park": park, "slot": slot + 1,
                     "p_hr": p_hr, "p_raw": p_raw, "fair": n.fair_american(p_hr),
-                    "bat_hr_pa": bat_r, "pit_hr_pa": pit_r,
-                    "match": f'{g["away_team"]} @ {g["home_team"]}',
-                })
+                    "bat_hr_pa": bat_r, "pit_hr_pa": pit_r, "match": match,
+                    "price": None, "book": None, "mkt_fair": None,
+                    "edge": None, "ev": None, "n_books": None,
+                }
+                o = odds.get((match, _norm(bname)))
+                if o:
+                    row["price"], row["book"] = o["price"], o["book"]
+                    row["mkt_fair"], row["n_books"] = o["fair"], o["n_books"]
+                    row["ev"] = n.ev_per_unit(p_hr, o["price"])
+                    if o["fair"] is not None:
+                        row["edge"] = p_hr - o["fair"]
+                board.append(row)
     board.sort(key=lambda r: r["p_hr"], reverse=True)
     return board
 
@@ -159,11 +242,29 @@ def main():
         print("No posted lineups yet — HR scanner runs best mid-afternoon.")
         return
     print(f"  {len(board)} batters in posted lineups\n")
-    print(f"{'Batter':22} {'Team':22} {'Slot':>4} {'Park':>5} {'vs SP':20} {'raw':>5} {'P(HR)':>6} {'Fair':>6}")
-    for r in board[:25]:
-        print(f"{r['batter'][:22]:22} {r['team'][:22]:22} {r['slot']:>4} "
-              f"{r['park']:>5.2f} {r['opp_p'][:20]:20} {r['p_raw']*100:4.1f}% "
-              f"{r['p_hr']*100:5.1f}% {r['fair']:>+6d}")
+    print("MODEL BOARD (top P(HR))")
+    print(f"{'Batter':22} {'Team':20} {'Sl':>2} {'Pk':>5} {'raw':>5} {'P(HR)':>6} {'Fair':>6} {'Book':>6}")
+    for r in board[:20]:
+        bk = f'{r["price"]:+d}' if r["price"] is not None else "—"
+        print(f"{r['batter'][:22]:22} {r['team'][:20]:20} {r['slot']:>2} "
+              f"{r['park']:>5.2f} {r['p_raw']*100:4.1f}% {r['p_hr']*100:5.1f}% "
+              f"{r['fair']:>+6d} {bk:>6}")
+
+    priced = [r for r in board if r["ev"] is not None]
+    trusted = [r for r in priced if (r["n_books"] or 0) >= MIN_BOOKS_VALUE]
+    if trusted:
+        trusted.sort(key=lambda r: r["ev"], reverse=True)
+        print(f"\nVALUE BOARD (EV at best price, >={MIN_BOOKS_VALUE} books) — "
+              f"{len(trusted)} of {len(priced)} priced")
+        print(f"{'Batter':22} {'P(HR)':>6} {'Book':>6} {'Src':>10} {'#bk':>3} {'Edge':>7} {'EV/u':>7}")
+        for r in trusted[:15]:
+            edge = f'{r["edge"]*100:+.1f}pp' if r["edge"] is not None else "—"
+            print(f"{r['batter'][:22]:22} {r['p_hr']*100:5.1f}% {r['price']:>+6d} "
+                  f"{str(r['book'])[:10]:>10} {r['n_books']:>3} {edge:>7} {r['ev']*100:>+6.1f}%")
+    elif priced:
+        print(f"\nVALUE BOARD: {len(priced)} prices, but all single-book "
+              f"(< {MIN_BOOKS_VALUE}) — no consensus, edges not trustworthy yet. "
+              "Run mid-afternoon when DK/FD/etc. post.")
 
 
 if __name__ == "__main__":
