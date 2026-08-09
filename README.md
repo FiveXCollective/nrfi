@@ -78,12 +78,26 @@ opposing top-of-order (`vs …`) each starter faces. Set `REQUIRE_CONFIRMED_LINE
 on a late-morning/pre-game re-run to keep pending-lineup games out of the suggested
 parlays, so you don't stack legs on a stale slate (probables can scratch).
 
+### Backtest / calibration (v2.3)
+`backtest.py` checks whether the model's probabilities are *calibrated* — when it
+says 65%, does NRFI happen ~65% of the time? It replays past dates with **no
+look-ahead** (each game scored using only data from before it) and reuses the exact
+production math. Output: a reliability table, Brier score vs. an always-base-rate
+baseline, log-loss, and a **Platt recalibration** fit (`sigmoid(a + b·logit(p))`) —
+a slope `b < 1` means the model is overconfident and the fitted `(a, b)` are the fix.
+```bash
+python backtest.py --start 2026-05-01 --end 2026-08-07 --min-starts 3
+```
+First run pulls each starter's season Statcast once (slow; cached after). Writes a
+per-game CSV and a reliability PNG. **Bet to the model's price only once it clears
+the base-rate Brier and the reliability gaps are small.**
+
 ### v2 upgrades (in priority order)
 1. ~~Opposing top-of-order quality~~ ✅ done (team-level; player-level is a further refinement).
 2. ~~Confirmed lineups~~ ✅ done (status + parlay gating; see above).
-3. Live NRFI odds feed → auto de-vigged edge + EV (biggest betting win).
-4. Park factor + weather (wind/temp).
-5. Player-level top-of-order (actual 1–3 hitters vs the starter's hand).
-6. Home-plate umpire zone.
-7. Half-inning correlation instead of strict independence.
-8. Then clone the whole skeleton for K-props and SB markets.
+3. ~~Live NRFI odds feed → de-vigged edge + EV~~ ✅ done (The Odds API 1st-inning totals).
+4. ~~Backtest / calibration harness~~ ✅ done (`backtest.py`; see above).
+5. Recalibrate the model with the Platt fit (or stronger shrinkage) so edges are believable.
+6. Park factor + weather (wind/temp).
+7. Player-level top-of-order (actual 1–3 hitters vs the starter's hand).
+8. Home-plate umpire zone; half-inning correlation; then clone for K-props & SB markets.
