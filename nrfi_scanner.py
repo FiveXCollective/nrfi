@@ -25,6 +25,7 @@ import sys
 import json
 import math
 import smtplib
+import statistics
 import datetime as dt
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -65,7 +66,18 @@ EDGE_MIN = float(os.getenv("EDGE_MIN", "0.03"))      # +3pp edge vs book to call
 # re-run so you don't stack legs on a stale slate (probables can scratch).
 REQUIRE_CONFIRMED_LINEUPS = os.getenv("REQUIRE_CONFIRMED_LINEUPS", "0") == "1"
 
-# Optional: JSON file of book lines to compute edge. Format:
+# --- Odds / edge ---
+# Live odds via The Odds API (https://the-odds-api.com). It has no market named
+# "NRFI", but 1st-inning totals (`totals_1st_1_innings`) at a 0.5 line ARE NRFI:
+#   Under 0.5 first-inning runs == NRFI ; Over 0.5 == YRFI.
+# These are "additional markets", only served by the per-event odds endpoint, so
+# we spend ~1 credit per game (+1 to list events). Best price across US books is
+# used for EV; the median per-book de-vigged line is the fair prob for edge.
+ODDS_API = "https://api.the-odds-api.com/v4"
+ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
+ODDS_REGIONS = os.getenv("ODDS_REGIONS", "us")
+
+# Fallback: a JSON file of book lines instead of the live API. Format:
 # [{"match": "Away Team @ Home Team", "nrfi": -115, "yrfi": -105}, ...]
 ODDS_FILE = os.getenv("ODDS_FILE", "")
 
@@ -233,14 +245,110 @@ def ev_per_unit(p, american):
 # ----------------------------------------------------------------------------
 # Build the board
 # ----------------------------------------------------------------------------
-def load_odds():
-    if not ODDS_FILE or not os.path.exists(ODDS_FILE):
-        return {}
+def _norm_team(s):
+    return "".join(ch.lower() for ch in (s or "") if ch.isalnum())
+
+
+def _parse_iso(s):
     try:
-        rows = json.load(open(ODDS_FILE))
-        return {r["match"]: r for r in rows}
+        return dt.datetime.fromisoformat((s or "").replace("Z", "+00:00"))
     except Exception:
-        return {}
+        return None
+
+
+def load_live_odds(games):
+    """Pull 1st-inning totals from The Odds API and reduce each game to:
+      {nrfi, yrfi, fair, book, n_books}
+    where nrfi/yrfi are the BEST (highest-payout) US prices, `fair` is the
+    median per-book de-vigged NRFI probability, and `book` is who posts the best
+    NRFI price. Only 0.5 lines count (that's what makes it NRFI/YRFI).
+    We look up each slate game's event id and fetch only those — ~1 credit each."""
+    ev = requests.get(
+        f"{ODDS_API}/sports/baseball_mlb/events",
+        params={"apiKey": ODDS_API_KEY}, timeout=30,
+    )
+    ev.raise_for_status()
+    events = ev.json()
+    # Group event ids by normalized (away, home) pair; keep commence_time to
+    # disambiguate doubleheaders / adjacent days by nearest first pitch.
+    by_pair = {}
+    for e in events:
+        key = (_norm_team(e.get("away_team")), _norm_team(e.get("home_team")))
+        by_pair.setdefault(key, []).append(e)
+
+    out, calls, matched = {}, 0, 0
+    for g in games:
+        cands = by_pair.get((_norm_team(g["away_team"]), _norm_team(g["home_team"])))
+        if not cands:
+            continue
+        if len(cands) == 1:
+            eid = cands[0]["id"]
+        else:  # pick the event whose start is closest to our game's start
+            gstart = _parse_iso(g.get("start"))
+            def _dist(e):
+                c = _parse_iso(e.get("commence_time"))
+                return abs((c - gstart).total_seconds()) if (c and gstart) else 1e18
+            eid = min(cands, key=_dist)["id"]
+
+        matched += 1
+        r = requests.get(
+            f"{ODDS_API}/sports/baseball_mlb/events/{eid}/odds",
+            params={"apiKey": ODDS_API_KEY, "regions": ODDS_REGIONS,
+                    "markets": "totals_1st_1_innings", "oddsFormat": "american"},
+            timeout=30,
+        )
+        calls += 1
+        if r.status_code != 200:
+            continue
+        best_nrfi = best_yrfi = best_book = None
+        fairs = []
+        for bm in r.json().get("bookmakers", []):
+            for mk in bm.get("markets", []):
+                if mk.get("key") != "totals_1st_1_innings":
+                    continue
+                under = over = None
+                for oc in mk.get("outcomes", []):
+                    if abs(float(oc.get("point", 0)) - 0.5) > 1e-9:
+                        continue  # only the 0.5 line is NRFI/YRFI
+                    if oc.get("name", "").lower() == "under":
+                        under = oc.get("price")
+                    elif oc.get("name", "").lower() == "over":
+                        over = oc.get("price")
+                if under is not None and over is not None:
+                    fairs.append(devig_two_way(under, over))
+                if under is not None and (best_nrfi is None
+                        or american_to_decimal(under) > american_to_decimal(best_nrfi)):
+                    best_nrfi, best_book = under, bm.get("key")
+                if over is not None and (best_yrfi is None
+                        or american_to_decimal(over) > american_to_decimal(best_yrfi)):
+                    best_yrfi = over
+        if best_nrfi is None:
+            continue
+        out[f'{g["away_team"]} @ {g["home_team"]}'] = {
+            "nrfi": best_nrfi, "yrfi": best_yrfi,
+            "fair": statistics.median(fairs) if fairs else None,
+            "book": best_book, "n_books": len(fairs),
+        }
+    print(f"  odds: {matched} games matched, {calls} event calls (~{calls + 1} credits),"
+          f" {len(out)} priced")
+    return out
+
+
+def load_odds(games):
+    """Live API if ODDS_API_KEY is set, else a local ODDS_FILE, else nothing."""
+    if ODDS_API_KEY:
+        try:
+            return load_live_odds(games)
+        except Exception as e:
+            print(f"  live odds fetch failed ({e}); continuing model-only", file=sys.stderr)
+            return {}
+    if ODDS_FILE and os.path.exists(ODDS_FILE):
+        try:
+            rows = json.load(open(ODDS_FILE))
+            return {r["match"]: r for r in rows}
+        except Exception:
+            return {}
+    return {}
 
 
 def build_board(games, odds):
@@ -292,14 +400,22 @@ def build_board(games, odds):
             "conf": conf,
             "min_starts": min_starts,
             "edge": None, "book": None, "ev": None,
+            "book_name": None, "mkt_fair": None, "n_books": None,
         }
 
         book = odds.get(row["match"])
-        if book and "nrfi" in book and "yrfi" in book:
-            fair_mkt = devig_two_way(book["nrfi"], book["yrfi"])
-            row["book"] = book["nrfi"]
-            row["edge"] = p_nrfi - fair_mkt          # model prob minus de-vigged market prob
-            row["ev"] = ev_per_unit(p_nrfi, book["nrfi"])
+        if book and book.get("nrfi") is not None:
+            # Prefer a supplied consensus fair prob; else de-vig the two sides.
+            fair_mkt = book.get("fair")
+            if fair_mkt is None and book.get("yrfi") is not None:
+                fair_mkt = devig_two_way(book["nrfi"], book["yrfi"])
+            if fair_mkt is not None:
+                row["book"] = book["nrfi"]              # best NRFI price (for EV / to bet)
+                row["book_name"] = book.get("book")
+                row["n_books"] = book.get("n_books")
+                row["mkt_fair"] = fair_mkt
+                row["edge"] = p_nrfi - fair_mkt         # model prob minus consensus de-vigged prob
+                row["ev"] = ev_per_unit(p_nrfi, book["nrfi"])
         board.append(row)
 
     board.sort(key=lambda r: r["p_nrfi"], reverse=True)
@@ -343,6 +459,21 @@ def render_html(board, parlays):
             return '<span style="color:#2ecc71;font-weight:600">✓ Set</span>'
         return '<span style="color:#7a8699">Pending</span>'
 
+    def book_cell(r):
+        if r["book"] is None:
+            return '<span style="color:#7a8699">—</span>'
+        src = ""
+        if r.get("book_name"):
+            nb = f' · {r["n_books"]}bk' if r.get("n_books") else ""
+            src = f'<br><span style="color:#5c6b7d;font-size:10px">{r["book_name"]}{nb}</span>'
+        return f'{r["book"]:+.0f}{src}'
+
+    def ev_cell(r):
+        if r["ev"] is None:
+            return '<span style="color:#7a8699">—</span>'
+        col = "#2ecc71" if r["ev"] > 0 else "#e74c3c"
+        return f'<span style="color:{col};font-weight:600">{r["ev"]*100:+.1f}%</span>'
+
     def starter_block(name, line, opp_top3):
         extra = (f'<br><span style="color:#5c6b7d;font-size:11px">vs {opp_top3}</span>'
                  if opp_top3 else "")
@@ -359,8 +490,9 @@ def render_html(board, parlays):
           </td>
           <td align="center" style="padding:10px 8px;border-bottom:1px solid #1f2733;font-weight:700">{pct(r['p_nrfi'])}</td>
           <td align="center" style="padding:10px 8px;border-bottom:1px solid #1f2733">{r['fair']:+d}</td>
-          <td align="center" style="padding:10px 8px;border-bottom:1px solid #1f2733">{r['book'] if r['book'] is not None else '—'}</td>
+          <td align="center" style="padding:10px 8px;border-bottom:1px solid #1f2733">{book_cell(r)}</td>
           <td align="center" style="padding:10px 8px;border-bottom:1px solid #1f2733">{edge_cell(r)}</td>
+          <td align="center" style="padding:10px 8px;border-bottom:1px solid #1f2733">{ev_cell(r)}</td>
           <td align="center" style="padding:10px 8px;border-bottom:1px solid #1f2733;font-size:11px">{lineups_cell(r)}</td>
           <td align="center" style="padding:10px 8px;border-bottom:1px solid #1f2733;font-size:11px;color:#9fb0c3">{r['conf']}</td>
         </tr>"""
@@ -388,12 +520,22 @@ def render_html(board, parlays):
     )
 
     has_odds = any(r["book"] is not None for r in board)
-    odds_note = "" if has_odds else (
-        '<div style="background:#2a1f12;border:1px solid #5c4326;border-radius:8px;'
-        'padding:10px 14px;color:#e0b877;font-size:12px;margin:0 0 16px">'
-        "No book lines loaded — showing model fair odds only. Wire an NRFI-capable odds "
-        "source (or drop a lines JSON via ODDS_FILE) to get de-vigged edge + EV.</div>"
-    )
+    if has_odds:
+        n_priced = sum(1 for r in board if r["book"] is not None)
+        odds_note = (
+            '<div style="background:#12181f;border:1px solid #1f2733;border-radius:8px;'
+            'padding:10px 14px;color:#9fb0c3;font-size:12px;margin:0 0 16px">'
+            f"Odds: {n_priced}/{len(board)} games priced from 1st-inning totals (Under 0.5 = NRFI). "
+            "<b>Book</b> = best US price; <b>Edge</b> = model − median de-vigged line; "
+            "<b>EV</b> = per-unit return at that best price. Bet only green EV.</div>"
+        )
+    else:
+        odds_note = (
+            '<div style="background:#2a1f12;border:1px solid #5c4326;border-radius:8px;'
+            'padding:10px 14px;color:#e0b877;font-size:12px;margin:0 0 16px">'
+            "No 1st-inning totals available for this slate — showing model fair odds only. "
+            "Set ODDS_API_KEY (or drop a lines JSON via ODDS_FILE) to get de-vigged edge + EV.</div>"
+        )
 
     return f"""\
 <!doctype html><html><body style="margin:0;background:#0b0f14;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif">
@@ -406,6 +548,7 @@ def render_html(board, parlays):
       <th style="padding:6px 8px">Game</th><th style="padding:6px 8px">Starters (1st-inn history)</th>
       <th style="padding:6px 8px" align="center">Model NRFI</th><th style="padding:6px 8px" align="center">Fair</th>
       <th style="padding:6px 8px" align="center">Book</th><th style="padding:6px 8px" align="center">Edge</th>
+      <th style="padding:6px 8px" align="center">EV</th>
       <th style="padding:6px 8px" align="center">Lineups</th>
       <th style="padding:6px 8px" align="center">Conf</th>
     </tr></thead><tbody>{rows}</tbody>
@@ -480,7 +623,7 @@ def main():
     if not games:
         send_email(f"<p>No games scheduled for {TODAY}.</p>")
         return
-    odds = load_odds()
+    odds = load_odds(games)
     board = build_board(games, odds)
     n_confirmed = sum(1 for r in board if r["lineups"])
     print(f"  {len(board)} games modeled · {n_confirmed} with lineups posted"
