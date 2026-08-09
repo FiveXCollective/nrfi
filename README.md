@@ -37,15 +37,29 @@ First run pulls Statcast for ~30 starters (~1-2 min); pybaseball caches after.
    - Min frequency is every 5 min; Railway starts the service, runs it, exits.
 5. That's it. `restartPolicyType: NEVER` keeps it from relooping after it finishes.
 
-## Adding real edge (odds)
-The Odds API's standard MLB feed is moneyline/spreads/totals only — no NRFI.
-To get auto-edge either:
-- Use a props-capable feed (e.g. Sports Game Odds) and wire it into `load_odds()`, or
-- Drop a `lines.json` and set `ODDS_FILE=lines.json`:
-  ```json
-  [{"match": "New York Yankees @ Boston Red Sox", "nrfi": -120, "yrfi": +100}]
-  ```
-  `match` must be exactly `"Away Team @ Home Team"` as MLB names them.
+## Real edge (odds)
+The Odds API has no market literally named NRFI, but **1st-inning totals**
+(`totals_1st_1_innings`) at a 0.5 line *are* NRFI: **Under 0.5 = NRFI**, Over 0.5 = YRFI.
+
+Set `ODDS_API_KEY` and the scanner pulls them automatically:
+- These are "additional markets", so they come from the per-event endpoint —
+  ~1 credit per game (+1 to list events); a 15-game slate ≈ 16 credits/run.
+  The free tier (500/mo) covers a once-daily run comfortably.
+- For each game it takes the **best US price** (for EV) and the **median per-book
+  de-vigged line** (the fair prob for edge). Digest columns: **Book** = best price +
+  source, **Edge** = model − fair, **EV** = per-unit return at the best price.
+- Coverage varies by book/game; unpriced games fall back to model-only.
+
+**Read the edge honestly.** A model showing +15–35pp "edges" is almost always the
+*model* being mis-calibrated, not free money — real NRFI edges are a few points.
+Treat large disagreements with the de-vigged market as a flag to distrust the model,
+and backtest calibration before betting to price. Not financial advice.
+
+Fallback without the API — drop a `lines.json` and set `ODDS_FILE=lines.json`:
+```json
+[{"match": "New York Yankees @ Boston Red Sox", "nrfi": -120, "yrfi": +100}]
+```
+`match` must be exactly `"Away Team @ Home Team"` as MLB names them.
 
 ## Model (v1.1)
 Each half-inning's scoreless probability blends two inputs via **log5**:
