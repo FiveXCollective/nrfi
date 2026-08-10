@@ -235,6 +235,90 @@ def build_board():
     return board
 
 
+# ----------------------------------------------------------------------------
+# Digest (HTML email) — reuses the Resend/SMTP transport from nrfi_scanner
+# ----------------------------------------------------------------------------
+def render_html(board, trusted):
+    def pct(x):
+        return f"{x*100:.1f}%"
+
+    def ev_span(r):
+        if r["ev"] is None:
+            return '<span style="color:#7a8699">—</span>'
+        col = "#2ecc71" if r["ev"] > 0 else "#e74c3c"
+        return f'<span style="color:{col};font-weight:600">{r["ev"]*100:+.0f}%</span>'
+
+    model_rows = ""
+    for r in board[:20]:
+        bk = f'{r["price"]:+d}' if r["price"] is not None else "—"
+        model_rows += f"""
+        <tr>
+          <td style="padding:8px;border-bottom:1px solid #1f2733">{r['batter']}
+            <span style="color:#5c6b7d;font-size:11px">· {r['team']} · slot {r['slot']} · pk {r['park']:.2f}</span><br>
+            <span style="color:#5c6b7d;font-size:11px">vs {r['opp_p']}</span></td>
+          <td align="center" style="padding:8px;border-bottom:1px solid #1f2733;font-weight:700">{pct(r['p_hr'])}</td>
+          <td align="center" style="padding:8px;border-bottom:1px solid #1f2733">{r['fair']:+d}</td>
+          <td align="center" style="padding:8px;border-bottom:1px solid #1f2733">{bk}</td>
+          <td align="center" style="padding:8px;border-bottom:1px solid #1f2733">{ev_span(r)}</td>
+        </tr>"""
+
+    if trusted:
+        vlegs = "".join(
+            f'<li style="margin:3px 0">{r["batter"]} — <b>{pct(r["p_hr"])}</b> '
+            f'@ {r["price"]:+d} ({r["book"]}, {r["n_books"]}bk) · EV {r["ev"]*100:+.0f}%</li>'
+            for r in trusted[:8])
+        value_html = (
+            f'<div style="font-size:15px;font-weight:800;margin:22px 0 6px">Value (≥{MIN_BOOKS_VALUE} books, +EV)</div>'
+            f'<ul style="margin:0 0 0 18px;padding:0;color:#c9d6e3;font-size:13px">{vlegs}</ul>')
+        parlays = [r for r in trusted if r["ev"] > 0][:3]
+        if len(parlays) >= 2:
+            p = 1.0
+            for r in parlays:
+                p *= r["p_hr"]
+            legs = "".join(f'<li>{r["batter"]} ({pct(r["p_hr"])})</li>' for r in parlays)
+            value_html += (
+                f'<div style="background:#12181f;border:1px solid #1f2733;border-radius:10px;padding:12px 16px;margin:12px 0">'
+                f'<div style="font-weight:700;color:#e0663a">{len(parlays)}-Leg HR Parlay · model hit {pct(p)} · fair {n.fair_american(p):+d}</div>'
+                f'<ul style="margin:6px 0 0 18px;color:#c9d6e3;font-size:13px">{legs}</ul>'
+                f'<div style="color:#7a8699;font-size:11px;margin-top:6px">High variance. Same-game legs are positively correlated (books price SGPs for it). Only fire if each leg beats its price.</div></div>')
+    else:
+        value_html = ('<div style="background:#2a1f12;border:1px solid #5c4326;border-radius:8px;'
+                      'padding:10px 14px;color:#e0b877;font-size:12px;margin:16px 0">'
+                      f'No multi-book consensus value yet (need ≥{MIN_BOOKS_VALUE} books). '
+                      'HR props fill in through the day — run mid-afternoon.</div>')
+
+    return f"""\
+<!doctype html><html><body style="margin:0;background:#0b0f14;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif">
+<div style="max-width:720px;margin:0 auto;padding:24px 16px;color:#e6edf3">
+  <div style="font-size:22px;font-weight:800">💣 HR Scanner</div>
+  <div style="color:#7a8699;font-size:13px;margin:2px 0 16px">{TODAY} · {len(board)} batters in posted lineups</div>
+  {value_html}
+  <div style="font-size:15px;font-weight:800;margin:22px 0 6px">Model board — top P(HR)</div>
+  <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;font-size:13px">
+    <thead><tr style="color:#7a8699;text-align:left;font-size:11px;text-transform:uppercase">
+      <th style="padding:6px 8px">Batter</th><th style="padding:6px 8px" align="center">P(HR)</th>
+      <th style="padding:6px 8px" align="center">Fair</th><th style="padding:6px 8px" align="center">Best</th>
+      <th style="padding:6px 8px" align="center">EV</th></tr></thead>
+    <tbody>{model_rows}</tbody>
+  </table>
+  <div style="color:#5c6b7d;font-size:11px;margin-top:20px;line-height:1.5">
+    P(≥1 HR) = 1−(1−p)^PA, p = batter HR/PA × pitcher HR-allowed/PA / league × park, then Platt-recalibrated
+    (backtest: 18.8k games, model beats base rate, calibrated in the bulk). EV uses the best US price; edge needs
+    a two-sided market to de-vig. Book coverage is thin until mid-afternoon. Not financial advice — bet within your means.
+  </div>
+</div></body></html>"""
+
+
+def send_digest(html):
+    subject = f"💣 HR Scanner — {TODAY}"
+    if n.RESEND_API_KEY:
+        n._send_via_resend(subject, html)
+    elif n.SMTP_USER and n.SMTP_PASS:
+        n._send_via_smtp(subject, html)
+    else:
+        print("No email transport configured — digest not sent.")
+
+
 def main():
     print(f"HR scan {TODAY} (season {SEASON})...")
     board = build_board()
@@ -265,6 +349,9 @@ def main():
         print(f"\nVALUE BOARD: {len(priced)} prices, but all single-book "
               f"(< {MIN_BOOKS_VALUE}) — no consensus, edges not trustworthy yet. "
               "Run mid-afternoon when DK/FD/etc. post.")
+
+    if os.getenv("SEND_EMAIL", "1") == "1":
+        send_digest(render_html(board, trusted))
 
 
 if __name__ == "__main__":
