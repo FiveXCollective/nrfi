@@ -1,4 +1,40 @@
-# NRFI Edge Scanner
+# MLB Prop Scanners
+
+Two run-once daily models (Railway cron, HTML digest via Resend):
+
+- **`hr_scanner.py` — HR Scanner (active).** Ranks each hitter in today's posted
+  lineups by P(≥1 HR), prices it against anytime-HR props (best line + de-vig),
+  and emails a value board + gated parlays. **Backtested on 18.8k batter-games:
+  beats the base-rate Brier and is well-calibrated (Platt-recalibrated).** See
+  [HR Scanner](#hr-scanner) below.
+- **`nrfi_scanner.py` — NRFI Scanner (retired).** Kept for reference. The backtest
+  showed it does **not** beat the base rate (Platt slope ≈ 0 — no signal), so its
+  edge/EV is not bettable. Don't deploy it; details preserved below.
+
+Shared infra: MLB Stats API (slate, lineups), Statcast, The Odds API
+(`ODDS_API_KEY`), and Resend email (`RESEND_API_KEY`). See `.env.example`.
+
+## HR Scanner
+`P(≥1 HR) = 1 − (1 − p)^PA`, where `p = batter_HR/PA × pitcher_HR-allowed/PA /
+league × park`, shrunk to league and **Platt-recalibrated** (`RECAL_A/RECAL_B`,
+fitted by `backtest_hr.py`). PA comes from the batting-order slot; park is a
+static HR factor. Odds: `batter_home_runs` Over 0.5 = anytime HR — best US price
+for EV, median per-book de-vig for edge. The value board is **gated to
+`MIN_BOOKS_VALUE` (default 2) books** so lone soft-book longshots (common in the
+morning) don't surface fake +EV.
+
+```bash
+export $(grep -v '^#' .env | xargs)
+SCAN_DATE=$(date +%F) python hr_scanner.py     # SEND_EMAIL=0 to only print
+python backtest_hr.py --prior-start 2026-03-01 --start 2026-05-01 --end 2026-08-07
+```
+**Run mid-afternoon**, not late morning: HR props (and lineups) fill in a few
+hours pre-game, so that's when you get multi-book consensus + confirmed slots.
+Next upgrades: handedness (batter vs pitcher hand), weather (temp/wind by park).
+
+---
+
+## NRFI Edge Scanner (retired — see note above)
 
 Daily MLB "No Run First Inning" model. Pulls today's slate + probable starters,
 scores each game's P(NRFI) from real 1st-inning data, ranks them, suggests
